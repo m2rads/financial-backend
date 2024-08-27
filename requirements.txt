@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+plaid-python
+pydantic
