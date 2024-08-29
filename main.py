@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Union, Tuple
 from plaid.model.sandbox_public_token_create_request import SandboxPublicTokenCreateRequest
 import calendar
+from datetime import date
 
 # Load environment variables from .env file
 load_dotenv()
@@ -49,8 +50,8 @@ class AnalyticsResponse(BaseModel):
     category_breakdown: dict
 
 class FinancialOverview(BaseModel):
-    income_tracking: Dict[str, List[Dict[str, Union[float, str]]]]
-    expense_tracking: Dict[str, Union[float, List[Tuple[str, float]], List[Tuple[str, float]]]]
+    income_tracking: Dict[str, List[Dict[str, Union[float, str, date]]]]
+    expense_tracking: Dict[str, Union[float, List[Tuple[str, float]]]]
     balance_overview: Dict[str, float]
     budgeting: Dict[str, Union[float, int]]
     financial_planning: Dict[str, Union[float, List[str]]]
@@ -189,8 +190,8 @@ def process_financial_data(transactions, accounts):
         expense_categories[category] = expense_categories.get(category, 0) + abs(t['amount'])
     
     expense_tracking = {
-        "total_monthly_expenses": total_expenses / 3,  # Assuming 90 days of data
-        "top_spending_categories": sorted(expense_categories.items(), key=lambda x: x[1], reverse=True)[:5],
+        "total_monthly_expenses": total_expenses / 3 if expenses else 0,  # Assuming 90 days of data
+        "top_spending_categories": sorted(expense_categories.items(), key=lambda x: x[1], reverse=True)[:5] if expense_categories else [],
         "expense_trend": calculate_expense_trend(expenses)
     }
 
@@ -225,19 +226,18 @@ def process_financial_data(transactions, accounts):
     )
 
 def predict_future_income(income):
-    # Simple prediction based on average income and frequency
     if not income:
         return []
     avg_income = sum(t['amount'] for t in income) / len(income)
-    last_income_date = datetime.strptime(income[-1]['date'], "%Y-%m-%d")
+    last_income_date = income[-1]['date']
     next_income_date = last_income_date + timedelta(days=30)  # Assuming monthly income
-    return [{"amount": avg_income, "date": next_income_date.strftime("%Y-%m-%d")}]
+    return [{"amount": avg_income, "date": next_income_date}]
 
 def calculate_expense_trend(expenses):
     # Group expenses by month and calculate total for each month
     monthly_expenses = {}
     for t in expenses:
-        month = t['date'][:7]  # YYYY-MM
+        month = t['date'].strftime("%Y-%m")  # Format date as YYYY-MM string
         monthly_expenses[month] = monthly_expenses.get(month, 0) + abs(t['amount'])
     return sorted(monthly_expenses.items())
 
@@ -264,19 +264,17 @@ def create_financial_plan(income_tracking, expense_tracking, balance_overview):
     }
 
 def create_calendar_visualization(transactions):
-    # Group transactions by date
     calendar_data = {}
     for t in transactions:
-        date = t['date']
-        if date not in calendar_data:
-            calendar_data[date] = []
-        calendar_data[date].append({
+        date_str = t['date'].isoformat()
+        if date_str not in calendar_data:
+            calendar_data[date_str] = []
+        calendar_data[date_str].append({
             "amount": t['amount'],
             "name": t['name'],
             "category": t['personal_finance_category']['primary']
         })
     
-    # Convert to list of dicts for easier frontend processing
     return [{"date": k, "transactions": v} for k, v in calendar_data.items()]
 
 if __name__ == "__main__":
