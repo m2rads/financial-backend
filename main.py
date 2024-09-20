@@ -1,7 +1,7 @@
 import os
 import certifi
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 import plaid
 from plaid.api import plaid_api
@@ -17,6 +17,9 @@ from typing import List, Dict, Any, Union, Tuple
 from plaid.model.sandbox_public_token_create_request import SandboxPublicTokenCreateRequest
 import calendar
 from datetime import date
+import requests
+import time
+import base64
 
 # Load environment variables from .env file
 load_dotenv()
@@ -277,6 +280,187 @@ def create_calendar_visualization(transactions):
     
     return [{"date": k, "transactions": v} for k, v in calendar_data.items()]
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+MX_BASE_URL = "https://int-api.mx.com"  # Development environment URL
+MX_CLIENT_ID = os.getenv('MX_CLIENT_ID')
+MX_API_KEY = os.getenv('MX_API_KEY')
+MX_BASIC_AUTH_VALUE = os.getenv('MX_BASIC_AUTH_VALUE')
+
+def mx_headers():
+    return {
+        "Accept": "application/vnd.mx.api.v1+json",
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {MX_BASIC_AUTH_VALUE}"
+    }
+
+@app.get("/mx_transactions/{user_guid}")
+async def get_mx_transactions(user_guid: str):
+    try:
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=180)  # Get last 6 months of data
+
+        url = f"{MX_BASE_URL}/users/{user_guid}/transactions"
+        params = {
+            "from_date": start_date.isoformat(),
+            "to_date": end_date.isoformat(),
+            "page": 1,
+            "records_per_page": 500  # Adjust as needed
+        }
+
+        transactions = []
+        while True:
+            response = requests.get(url, headers=mx_headers(), params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            transactions.extend(data['transactions'])
+            
+            if data['pagination']['current_page'] >= data['pagination']['total_pages']:
+                break
+            
+            params['page'] += 1
+
+        return {"transactions": transactions}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class MXUser(BaseModel):
+    email: str
+    id: str
+    is_disabled: bool = False
+    metadata: str = ""
+
+@app.post("/create_mx_user")
+async def create_mx_user(user: MXUser):
+    try:
+        url = f"{MX_BASE_URL}/users"
+        payload = {
+            "user": user.dict()
+        }
+        headers = mx_headers()
+        print(f"Headers: {headers}")  # Debug print
+        response = requests.post(url, headers=headers, json=payload)
+        print(f"Response status: {response.status_code}")  # Debug print
+        print(f"Response content: {response.text}")  # Debug print
+        response.raise_for_status()
+        data = response.json()
+        return {"user_guid": data['user']['guid']}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+class MXMember(BaseModel):
+    user_guid: str
+    institution_code: str
+    credentials: dict
+
+@app.post("/connect_mx_bank")
+async def connect_mx_bank(member: MXMember, background_tasks: BackgroundTasks):
+    try:
+        # Step 1: Create a member (connection to a financial institution)
+        url = f"{MX_BASE_URL}/users/{member.user_guid}/members"
+        payload = {
+            "member": {
+                "institution_code": member.institution_code,
+                "credentials": member.credentials
+            }
+        }
+        response = requests.post(url, headers=mx_headers(), json=payload)
+        response.raise_for_status()
+        data = response.json()
+        member_guid = data['member']['guid']
+
+        # Step 2: Aggregate the member's accounts (this is an asynchronous process)
+        url = f"{MX_BASE_URL}/users/{member.user_guid}/members/{member_guid}/aggregate"
+        response = requests.post(url, headers=mx_headers())
+        response.raise_for_status()
+
+        # Step 3: Start a background task to check aggregation status
+        background_tasks.add_task(check_aggregation_status, member.user_guid, member_guid)
+
+        return {"message": "Bank connection initiated. Aggregation in progress."}
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+async def check_aggregation_status(user_guid: str, member_guid: str):
+    url = f"{MX_BASE_URL}/users/{user_guid}/members/{member_guid}/status"
+    max_attempts = 10
+    attempt = 0
+
+    while attempt < max_attempts:
+        try:
+            response = requests.get(url, headers=mx_headers())
+            response.raise_for_status()
+            data = response.json()
+            status = data['member']['connection_status']
+
+            if status == 'CONNECTED':
+                print(f"Member {member_guid} successfully aggregated.")
+                return
+            elif status in ['FAILED', 'DENIED', 'PREVENTED', 'REJECTED', 'EXPIRED']:
+                print(f"Aggregation failed for member {member_guid}. Status: {status}")
+                return
+
+            time.sleep(5)  # Wait for 5 seconds before checking again
+            attempt += 1
+        except requests.RequestException as e:
+            print(f"Error checking aggregation status: {str(e)}")
+            return
+
+    print(f"Aggregation status check timed out for member {member_guid}")
+
+@app.get("/mx_institutions")
+async def get_mx_institutions(
+    name: str = Query(None, description="List only institutions in which the appended string appears."),
+    page: int = Query(1, description="Specify current page."),
+    records_per_page: int = Query(25, ge=10, le=100, description="Number of records per page. Range: 10-100."),
+    supports_account_identification: bool = Query(None, description="Filter institutions supporting account identification."),
+    supports_account_statement: bool = Query(None, description="Filter institutions supporting account statements."),
+    supports_account_verification: bool = Query(None, description="Filter institutions supporting account verification."),
+    supports_transaction_history: bool = Query(None, description="Filter institutions supporting extended transaction history.")
+):
+    try:
+        url = f"{MX_BASE_URL}/institutions"
+        params = {
+            "page": page,
+            "records_per_page": records_per_page
+        }
+        
+        # Add optional parameters if they are provided
+        if name:
+            params["name"] = name
+        if supports_account_identification is not None:
+            params["supports_account_identification"] = supports_account_identification
+        if supports_account_statement is not None:
+            params["supports_account_statement"] = supports_account_statement
+        if supports_account_verification is not None:
+            params["supports_account_verification"] = supports_account_verification
+        if supports_transaction_history is not None:
+            params["supports_transaction_history"] = supports_transaction_history
+
+        response = requests.get(url, headers=mx_headers(), params=params)
+        print(f"Request URL: {response.url}")  # Debug print
+        print(f"Response status code: {response.status_code}")  # Debug print
+        print(f"Response headers: {response.headers}")  # Debug print
+        print(f"Response content: {response.text[:1000]}")  # Print first 1000 characters for debugging
+
+        response.raise_for_status()
+        data = response.json()
+        
+        institutions = data.get('institutions', [])
+        
+        return {
+            "institutions": [
+                {
+                    "name": inst['name'],
+                    "institution_code": inst['code'],
+                    "medium_logo_url": inst['medium_logo_url']
+                }
+                for inst in institutions
+            ],
+            "pagination": data.get('pagination', {}),
+            "total_institutions": len(institutions)
+        }
+    except requests.RequestException as e:
+        print(f"Error: {str(e)}")  # Debug print
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Error response content: {e.response.text}")  # Debug print
+        raise HTTPException(status_code=400, detail=str(e))
