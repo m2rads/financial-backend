@@ -2,3 +2,4 @@ fastapi
 uvicorn
 plaid-python
 pydantic
+mx_platform_python
